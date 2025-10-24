@@ -74,6 +74,16 @@ void Handle_Signal(int sig)
             if (pid > 0)
                 kill(-pid, SIGTSTP);
         }
+
+        for (auto &WP : WProcess)
+        {
+            if (WP.pid > 0)
+                kill(-WP.pid, SIGTSTP);
+        }
+
+        if (shell_pgid > 0)
+            tcsetpgrp(STDIN_FILENO, shell_pgid);
+
         return;
     }
 
@@ -86,8 +96,10 @@ void Handle_Signal(int sig)
 
     for (auto &WP : WProcess)
     {
-        kill(WP.pid, SIGTERM);
-        close(WP.fd);
+        if (WP.pid > 0)
+            kill(WP.pid, SIGTERM);
+        if (WP.fd >= 0)
+            close(WP.fd);
         remove(WP.tempfile.c_str());
     }
     WProcess.clear();
@@ -313,11 +325,19 @@ void Run_Command(string &cmd)
             pid_t pid = fork();
             if (pid == 0)
             {
+                setpgid(0, 0);
+
                 string File_Name = ".temp." + to_string(getpid()) + ".txt";
                 int File_Descriptor = open(File_Name.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                if (File_Descriptor == -1)
+                {
+                    perror("Open Temp File Error");
+                    _exit(1);
+                }
 
                 dup2(File_Descriptor, STDOUT_FILENO);
                 dup2(File_Descriptor, STDERR_FILENO);
+                close(File_Descriptor);
 
                 execvp(argv[0], argv.data());
                 perror("EXECVP ERROR!!");
@@ -325,6 +345,9 @@ void Run_Command(string &cmd)
             }
             else if (pid > 0)
             {
+                setpgid(pid, pid);
+                g_child_pid.push_back(pid);
+
                 string File_Name = ".temp." + to_string(pid) + ".txt";
                 for (int j = 0; j < 10 && !filesystem::exists(File_Name); ++j)
                     usleep(100000);
@@ -376,11 +399,46 @@ void Run_Command(string &cmd)
             for (ssize_t i = WProcess.size() - 1; i >= 0; i--)
             {
                 int status = 0;
-                pid_t ret_pid = waitpid(WProcess[i].pid, &status, WNOHANG);
-                if (ret_pid == WProcess[i].pid)
+                pid_t ret_pid = waitpid(WProcess[i].pid, &status, WNOHANG | WUNTRACED);
+                if (ret_pid == 0)
+                    continue;
+                else if (ret_pid == -1)
                 {
-                    close(WProcess[i].fd);
+                    if (WProcess[i].fd >= 0)
+                        close(WProcess[i].fd);
                     remove(WProcess[i].tempfile.c_str());
+
+                    auto it = find(g_child_pid.begin(), g_child_pid.end(), WProcess[i].pid);
+                    if (it != g_child_pid.end())
+                        g_child_pid.erase(it);
+                    WProcess.erase(WProcess.begin() + i);
+                }
+                else if (WIFSTOPPED(status))
+                {
+                    if (WProcess[i].fd >= 0)
+                        close(WProcess[i].fd);
+
+                    auto stopped_pid = WProcess[i].pid;
+                    remove(WProcess[i].tempfile.c_str());
+                    WProcess.erase(WProcess.begin() + i);
+
+                    auto it = find(g_child_pid.begin(), g_child_pid.end(), stopped_pid);
+                    if (it != g_child_pid.end())
+                        g_child_pid.erase(it);
+
+                    if (shell_pgid > 0)
+                        tcsetpgrp(STDIN_FILENO, shell_pgid);
+                }
+                else
+                {
+                    if (WProcess[i].fd >= 0)
+                        close(WProcess[i].fd);
+                    remove(WProcess[i].tempfile.c_str());
+
+                    auto it = find(g_child_pid.begin(), g_child_pid.end(), WProcess[i].pid);
+                    if (it != g_child_pid.end())
+                        g_child_pid.erase(it);
+
                     WProcess.erase(WProcess.begin() + i);
                 }
             }
@@ -388,6 +446,10 @@ void Run_Command(string &cmd)
 
         for (auto &proc : WProcess)
         {
+            auto it = find(g_child_pid.begin(), g_child_pid.end(), proc.pid);
+            if (it != g_child_pid.end())
+                g_child_pid.erase(it);
+
             kill(proc.pid, SIGKILL);
             close(proc.fd);
             remove(proc.tempfile.c_str());
