@@ -7,13 +7,7 @@
 #include <termios.h>
 #include <semaphore.h>
 
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
-
-#include "headers/util.h"
-#include "headers/history.h"
-
+#include <ctime>
 #include <locale>
 #include <string>
 #include <vector>
@@ -25,21 +19,33 @@
 #include <algorithm>
 #include <filesystem>
 
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+
+#include "headers/util.h"
+#include "headers/history.h"
+
 #define MAX_HISTORY_SIZE 1000
 
 using namespace std;
 
-struct Watchprocess
+typedef struct
 {
     int fd;
     pid_t pid;
     string cmd;
     string tempfile;
-};
+} Watchprocess;
 
 pid_t shell_pgid;
 vector<pid_t> g_child_pid;
 vector<Watchprocess> WProcess;
+
+string g_pending_input;
+pid_t g_foreground_pid = -1;
+int g_interactive_write_fd = -1;
+bool g_frontend_stdin_closed = false;
 
 sem_t *Shared_History_Semaphore = nullptr;
 SharedHistory *Shared_History_Data = nullptr;
@@ -47,21 +53,137 @@ SharedHistory *Shared_History_Data = nullptr;
 void Handle_Signal(int);
 void Run_Command(string &);
 
+static void Block_Watch_Signals(sigset_t &old_mask)
+{
+    sigset_t block_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGINT);
+    sigaddset(&block_mask, SIGTSTP);
+    sigprocmask(SIG_BLOCK, &block_mask, &old_mask);
+}
+
+static void Restore_Watch_Signals(const sigset_t &old_mask)
+{
+    sigprocmask(SIG_SETMASK, &old_mask, nullptr);
+}
+
+static void Redirect_Stdin_To_DevNull()
+{
+    int DevNull_FD = open("/dev/null", O_RDONLY);
+    if (DevNull_FD != -1)
+    {
+        dup2(DevNull_FD, STDIN_FILENO);
+        close(DevNull_FD);
+    }
+}
+
+static bool Read_Next_Line(string &line)
+{
+    while (true)
+    {
+        size_t pos = g_pending_input.find('\n');
+        if (pos != string::npos)
+        {
+            line = g_pending_input.substr(0, pos);
+            g_pending_input.erase(0, pos + 1);
+            return true;
+        }
+
+        char buf[4096];
+        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+        if (n <= 0)
+            return false;
+        g_pending_input.append(buf, n);
+    }
+}
+
 int main()
 {
     setlocale(LC_ALL, "");
     signal(SIGINT, Handle_Signal);
     signal(SIGTSTP, Handle_Signal);
+    signal(SIGPIPE, SIG_IGN);
 
     shell_pgid = getpgrp();
     Attach_Shared_Memory();
 
-    string line;
-    while (getline(cin, line))
+    while (true)
+    {
+        if (g_foreground_pid > 0)
+        {
+            string chunk;
+            if (!g_pending_input.empty())
+            {
+                chunk = move(g_pending_input);
+                g_pending_input.clear();
+            }
+            else if (!g_frontend_stdin_closed)
+            {
+                struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+                int poll_rc = poll(&pfd, 1, 100);
+                if (poll_rc > 0 && (pfd.revents & POLLIN))
+                {
+                    char buf[4096];
+                    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+                    if (n > 0)
+                        chunk.assign(buf, n);
+                    else
+                        g_frontend_stdin_closed = true;
+                }
+            }
+            else
+            {
+                struct timespec ts = {0, 100 * 1000 * 1000};
+                nanosleep(&ts, nullptr);
+            }
+
+            if (!chunk.empty() && g_interactive_write_fd != -1)
+            {
+                for (char c : chunk)
+                {
+                    if (c == '\x04')
+                    {
+                        close(g_interactive_write_fd);
+                        g_interactive_write_fd = -1;
+                        break;
+                    }
+                    if (write(g_interactive_write_fd, &c, 1) < 0)
+                        break;
+                }
+            }
+
+            if (g_foreground_pid > 0)
+            {
+                int status;
+                pid_t ret_pid = waitpid(g_foreground_pid, &status, WNOHANG | WUNTRACED);
+                if (ret_pid == g_foreground_pid)
+                {
+                    if (g_interactive_write_fd != -1)
+                    {
+                        close(g_interactive_write_fd);
+                        g_interactive_write_fd = -1;
+                    }
+                    if (!WIFSTOPPED(status))
+                        g_child_pid.clear();
+                    if (shell_pgid > 0)
+                        tcsetpgrp(STDIN_FILENO, shell_pgid);
+
+                    cout << '\x02' << flush;
+                    g_foreground_pid = -1;
+                }
+            }
+
+            continue;
+        }
+
+        string line;
+        if (!Read_Next_Line(line))
+            break;
+
         Run_Command(line);
+    }
 
     Detach_Shared_Memory();
-
     return 0;
 }
 
@@ -73,12 +195,6 @@ void Handle_Signal(int sig)
         {
             if (pid > 0)
                 kill(-pid, SIGTSTP);
-        }
-
-        for (auto &WP : WProcess)
-        {
-            if (WP.pid > 0)
-                kill(-WP.pid, SIGTSTP);
         }
 
         if (shell_pgid > 0)
@@ -216,7 +332,7 @@ void Run_Command(string &cmd)
                         break;
 
                     fflush(stdout);
-                    if (getline(cin, next_line))
+                    if (Read_Next_Line(next_line))
                     {
                         content_buffer += "\n" + next_line;
                     }
@@ -290,7 +406,7 @@ void Run_Command(string &cmd)
         vector<string> Commands;
 
         bool is_started = false;
-        for (int i = 0; i < cmd.size(); i++)
+        for (size_t i = 0; i < cmd.size(); i++)
         {
             if (cmd[i] == '"')
             {
@@ -326,6 +442,9 @@ void Run_Command(string &cmd)
             if (pid == 0)
             {
                 setpgid(0, 0);
+                signal(SIGTSTP, SIG_DFL);
+
+                Redirect_Stdin_To_DevNull();
 
                 string File_Name = ".temp." + to_string(getpid()) + ".txt";
                 int File_Descriptor = open(File_Name.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -346,14 +465,21 @@ void Run_Command(string &cmd)
             else if (pid > 0)
             {
                 setpgid(pid, pid);
+
+                sigset_t old_mask;
+                Block_Watch_Signals(old_mask);
                 g_child_pid.push_back(pid);
+                Restore_Watch_Signals(old_mask);
 
                 string File_Name = ".temp." + to_string(pid) + ".txt";
                 for (int j = 0; j < 10 && !filesystem::exists(File_Name); ++j)
                     usleep(100000);
 
                 int File_Descriptor = open(File_Name.c_str(), O_RDONLY | O_NONBLOCK);
+
+                Block_Watch_Signals(old_mask);
                 WProcess.push_back({File_Descriptor, pid, Commands[i], File_Name});
+                Restore_Watch_Signals(old_mask);
             }
             else
             {
@@ -363,7 +489,7 @@ void Run_Command(string &cmd)
 
         while (!WProcess.empty())
         {
-            int No_Of_Watch_Process = WProcess.size();
+            size_t No_Of_Watch_Process = WProcess.size();
             vector<struct pollfd> Poll_FDs(No_Of_Watch_Process);
             for (size_t i = 0; i < No_Of_Watch_Process; i++)
             {
@@ -396,6 +522,9 @@ void Run_Command(string &cmd)
                 }
             }
 
+            sigset_t old_mask;
+            Block_Watch_Signals(old_mask);
+
             for (ssize_t i = WProcess.size() - 1; i >= 0; i--)
             {
                 int status = 0;
@@ -415,16 +544,7 @@ void Run_Command(string &cmd)
                 }
                 else if (WIFSTOPPED(status))
                 {
-                    if (WProcess[i].fd >= 0)
-                        close(WProcess[i].fd);
-
-                    auto stopped_pid = WProcess[i].pid;
-                    remove(WProcess[i].tempfile.c_str());
                     WProcess.erase(WProcess.begin() + i);
-
-                    auto it = find(g_child_pid.begin(), g_child_pid.end(), stopped_pid);
-                    if (it != g_child_pid.end())
-                        g_child_pid.erase(it);
 
                     if (shell_pgid > 0)
                         tcsetpgrp(STDIN_FILENO, shell_pgid);
@@ -442,19 +562,28 @@ void Run_Command(string &cmd)
                     WProcess.erase(WProcess.begin() + i);
                 }
             }
+
+            Restore_Watch_Signals(old_mask);
         }
 
-        for (auto &proc : WProcess)
         {
-            auto it = find(g_child_pid.begin(), g_child_pid.end(), proc.pid);
-            if (it != g_child_pid.end())
-                g_child_pid.erase(it);
+            sigset_t old_mask;
+            Block_Watch_Signals(old_mask);
 
-            kill(proc.pid, SIGKILL);
-            close(proc.fd);
-            remove(proc.tempfile.c_str());
+            for (auto &proc : WProcess)
+            {
+                auto it = find(g_child_pid.begin(), g_child_pid.end(), proc.pid);
+                if (it != g_child_pid.end())
+                    g_child_pid.erase(it);
+
+                kill(proc.pid, SIGKILL);
+                close(proc.fd);
+                remove(proc.tempfile.c_str());
+            }
+            WProcess.clear();
+
+            Restore_Watch_Signals(old_mask);
         }
-        WProcess.clear();
     }
     else if (cmd.find('|') != string::npos)
     {
@@ -501,6 +630,10 @@ void Run_Command(string &cmd)
                 if (i > 0)
                 {
                     dup2(Pipes[i - 1][0], STDIN_FILENO);
+                }
+                else
+                {
+                    Redirect_Stdin_To_DevNull();
                 }
                 if (i < No_Of_Commands - 1)
                 {
@@ -593,6 +726,14 @@ void Run_Command(string &cmd)
             argv.push_back(const_cast<char *>(a.c_str()));
         argv.push_back(nullptr);
 
+        bool Use_Interactive_Pipe = Input_File.empty();
+        int Interactive_Pipe[2] = {-1, -1};
+        if (Use_Interactive_Pipe && pipe(Interactive_Pipe) == -1)
+        {
+            perror("INTERACTIVE PIPE FAILED");
+            Use_Interactive_Pipe = false;
+        }
+
         pid_t pid = fork();
         if (pid == 0)
         {
@@ -617,6 +758,16 @@ void Run_Command(string &cmd)
                     _exit(1);
                 }
                 close(Read_FD);
+            }
+            else if (Use_Interactive_Pipe)
+            {
+                dup2(Interactive_Pipe[0], STDIN_FILENO);
+                close(Interactive_Pipe[0]);
+                close(Interactive_Pipe[1]);
+            }
+            else
+            {
+                Redirect_Stdin_To_DevNull();
             }
             if (!Output_File.empty())
             {
@@ -653,25 +804,40 @@ void Run_Command(string &cmd)
         else if (pid > 0)
         {
             setpgid(pid, pid);
-
             tcsetpgrp(STDIN_FILENO, pid);
             g_child_pid.push_back(pid);
 
-            int status;
-            pid_t ret_pid;
-            do
+            if (Use_Interactive_Pipe)
             {
-                ret_pid = waitpid(pid, &status, WUNTRACED);
-            } while (ret_pid == -1 && errno == EINTR);
+                close(Interactive_Pipe[0]);
+                g_interactive_write_fd = Interactive_Pipe[1];
+                g_foreground_pid = pid;
+                g_frontend_stdin_closed = false;
+                cout << '\x01' << flush;
+            }
+            else
+            {
+                int status;
+                pid_t ret_pid;
+                do
+                {
+                    ret_pid = waitpid(pid, &status, WUNTRACED);
+                } while (ret_pid == -1 && errno == EINTR);
 
-            if (!WIFSTOPPED(status))
-                g_child_pid.clear();
+                if (!WIFSTOPPED(status))
+                    g_child_pid.clear();
 
-            tcsetpgrp(STDIN_FILENO, shell_pgid);
+                tcsetpgrp(STDIN_FILENO, shell_pgid);
+            }
         }
         else
         {
             perror("FORK FAILED IN ELSE PART!!");
+            if (Use_Interactive_Pipe)
+            {
+                close(Interactive_Pipe[0]);
+                close(Interactive_Pipe[1]);
+            }
         }
     }
 }

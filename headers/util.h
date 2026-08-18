@@ -68,12 +68,12 @@ string Get_Current_Path(pid_t pid)
     string Proc_Path = "/proc/" + to_string(pid) + "/cwd";
     ssize_t len = readlink(Proc_Path.c_str(), buffer, sizeof(buffer) - 1);
 
-    string prompt = string(user) + "@" + hostname;
+    string prompt = "\x1b[1;32m" + string(user) + "@" + hostname + "\x1b[0m";
 
     if (len != -1)
     {
         buffer[len] = '\0';
-        prompt = prompt + ":" + buffer + "$ ";
+        prompt = prompt + ":\x1b[1;34m" + buffer + "\x1b[0m$ ";
     }
     else
         prompt += "$ ";

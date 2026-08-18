@@ -1,12 +1,17 @@
-## 🛠️ Steps for compiling custom terminal and run the terminal.
+## Steps for compiling custom terminal and run the terminal.
 
 ```bash
     sudo apt install libxft-dev libfreetype6-dev
     sudo apt install fonts-noto fonts-dejavu
 
-    export echo LANG=en_US.UTF-8
+    export LANG=en_US.UTF-8
 
-    g++ function.cpp -o function
-    g++ terminal.cpp -o terminal -lX11 -lXft -I/usr/include/freetype2
+	make icon
+	make install-icon
+    make file-icon
+    make
+  
     ./terminal
 ```
+
+Or build and run in one step with `make run`. Use `make clean` to remove the built binaries.

@@ -1,0 +1,20 @@
+# Build binaries
+/function
+/terminal
+
+# Object files
+*.o
+*.obj
+*.txt
+
+# Runtime/generated files
+.terminal.history.txt
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store

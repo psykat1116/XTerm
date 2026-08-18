@@ -10,10 +10,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#include "headers/tab.h"
-#include "headers/util.h"
-#include "headers/history.h"
-
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
@@ -34,44 +30,21 @@
 #include <iostream>
 #include <algorithm>
 
+#include "headers/tab.h"
+#include "headers/util.h"
+#include "headers/ansi.h"
+#include "headers/render.h"
+#include "headers/globals.h"
+#include "headers/history.h"
+#include "headers/clipboard.h"
+
 using namespace std;
-
-GC gc;
-int screen;
-Window window;
-Display *display;
-
-Atom primaryAtom;
-Atom propertyAtom;
-Atom clipboardAtom;
-Atom utf8StringAtom;
-
-XftColor Xft_Color;
-XftFont *Xft_Font = nullptr;
-XftDraw *Xft_Draw = nullptr;
 
 sem_t *Shared_History_Semaphore = nullptr;
 SharedHistory *Shared_History_Data = nullptr;
 
-int Tab_Height = 28;
-bool Cursor_Visible = true;
-int Win_Width = 800, Win_Height = 800;
-
-const int TAB_WIDTH = 160;
-const int PLUS_BOX_W = 18;
-const int PLUS_BOX_H = 18;
-const int CLOSE_BOX_W = 14;
-const int CLOSE_BOX_H = 14;
-const int TAB_PADDING_L = 8;
-const int TAB_PADDING_TOP = 6;
-
-void Draw_UI();
 void Process();
 void Handle_Signal(int);
-void ProcessPasteData(XSelectionEvent *);
-void Add_To_Buffer(Tab &, const string &);
-static inline int UTF8_Width(const string &);
-void DrawUtf8(XftDraw *, XftFont *, XftColor *, int, int, const string &);
 
 int main(int argc, char *argv[])
 {
@@ -112,52 +85,12 @@ int main(int argc, char *argv[])
     XMapWindow(display, window);
     XSelectInput(display, window, ExposureMask | KeyPressMask | StructureNotifyMask | ButtonPressMask | SelectionNotify);
     XStoreName(display, window, "XTerm [Ctrl-T new tab, Ctrl-W close tab, Esc close]");
+    Set_Window_Icon();
 
     gc = XCreateGC(display, window, 0, nullptr);
 
-    Visual *Visual = DefaultVisual(display, screen);
-    Colormap Colormap = DefaultColormap(display, screen);
-
-    const char *font_name_list[] = {
-        "DejaVu Sans Mono:size=12",
-        "Noto Sans Devanagari:size=12",
-        "Noto Sans Bengali:size=12",
-        "Noto Sans Tamil:size=12",
-        "Noto Sans Arabic:size=12",
-        "Noto Sans CJK SC:size=12",
-        "Noto Sans CJK TC:size=12",
-        "Noto Sans CJK JP:size=12",
-        "Noto Sans CJK KR:size=12",
-        "Noto Color Emoji:size=12",
-        "Noto Sans Mono:size=12",
-        "Monospace:size=12"};
-
-    Xft_Font = nullptr;
-    for (auto &fname : font_name_list)
-    {
-        Xft_Font = XftFontOpenName(display, screen, fname);
-        if (Xft_Font)
-            break;
-    }
-    if (!Xft_Font)
-    {
-        cerr << "Fatal Error: No Xft font available" << endl;
+    if (!Render_Init())
         return 1;
-    }
-
-    Xft_Draw = XftDrawCreate(display, window, Visual, Colormap);
-    if (!Xft_Draw)
-    {
-        cerr << "Fatal Error: XftDrawCreate failed" << endl;
-        XftFontClose(display, Xft_Font);
-        return 1;
-    }
-
-    XRenderColor renderColor = {0xffff, 0xffff, 0xffff, 0xffff};
-    if (!XftColorAllocValue(display, Visual, Colormap, &renderColor, &Xft_Color))
-    {
-        cerr << "Warning: XftColorAllocValue failed" << endl;
-    }
 
     unique_ptr<Tab> First_Tab = Create_Tab();
     if (First_Tab)
@@ -174,18 +107,7 @@ int main(int argc, char *argv[])
     Process();
 
     Cleanup_Shared_Memory();
-
-    if (Xft_Draw)
-    {
-        XftDrawDestroy(Xft_Draw);
-        Xft_Draw = nullptr;
-    }
-    if (Xft_Font)
-    {
-        XftFontClose(display, Xft_Font);
-        Xft_Font = nullptr;
-    }
-    XftColorFree(display, Visual, Colormap, &Xft_Color);
+    Render_Cleanup();
 
     XFreeGC(display, gc);
     XDestroyWindow(display, window);
@@ -239,14 +161,13 @@ void Process()
             if (!(T->is_alive && T->fd_read >= 0))
                 continue;
 
-            bool got_eof_or_error = false;
             if (Index < File_Descriptors.size() && File_Descriptors[Index].revents & POLLIN)
             {
                 char Buffer[4096];
                 ssize_t Read_Byte_Count = read(T->fd_read, Buffer, sizeof(Buffer));
                 if (Read_Byte_Count > 0)
                 {
-                    Add_To_Buffer(*T, string(Buffer, Buffer + Read_Byte_Count));
+                    AddToBuffer(*T, string(Buffer, Buffer + Read_Byte_Count));
                 }
                 else if (Read_Byte_Count == 0)
                 {
@@ -291,6 +212,110 @@ void Process()
                 {
                     running = false;
                 }
+                else if (Tabs[Active_Tab]->foreground_busy)
+                {
+                    Tab &T = *Tabs[Active_Tab];
+
+                    if (IS_CTRL && (keysym == XK_c || Key_Buffer[0] == 'c'))
+                    {
+                        if (T.child_pid >= 0)
+                            kill(T.child_pid, SIGINT);
+                        Draw_UI();
+                    }
+                    else if (IS_CTRL && (keysym == XK_z || Key_Buffer[0] == 'z'))
+                    {
+                        if (T.child_pid > 0)
+                            kill(T.child_pid, SIGTSTP);
+                        Draw_UI();
+                    }
+                    else if (IS_CTRL && (keysym == XK_d || Key_Buffer[0] == 'd'))
+                    {
+                        if (T.line.empty() && T.fd_write >= 0)
+                        {
+                            char EOF_Char = 4;
+                            if (write(T.fd_write, &EOF_Char, 1) < 0)
+                                perror("Error Writing EOF Character");
+                        }
+                        Draw_UI();
+                    }
+                    else if (IS_CTRL && (keysym == XK_v || Key_Buffer[0] == 'v'))
+                    {
+                        XConvertSelection(
+                            display,
+                            clipboardAtom,
+                            utf8StringAtom,
+                            propertyAtom,
+                            window,
+                            event.xkey.time);
+
+                        XFlush(display);
+                    }
+                    else if (IS_CTRL && keysym == XK_Left)
+                    {
+                        Active_Tab = (Active_Tab - 1 + Tabs.size()) % Tabs.size();
+                        Draw_UI();
+                    }
+                    else if (IS_CTRL && keysym == XK_Right)
+                    {
+                        Active_Tab = (Active_Tab + 1) % Tabs.size();
+                        Draw_UI();
+                    }
+                    else if (IS_CTRL && (keysym == XK_t || Key_Buffer[0] == 't'))
+                    {
+                        unique_ptr<Tab> New_Tab = Create_Tab();
+                        if (New_Tab)
+                        {
+                            Tabs.emplace_back(move(New_Tab));
+                            Active_Tab = Tabs.size() - 1;
+                            Draw_UI();
+                        }
+                    }
+                    else if (IS_CTRL && (keysym == XK_w || Key_Buffer[0] == 'w'))
+                    {
+                        if (Tabs.size() > 1)
+                        {
+                            Close_Tab(Active_Tab);
+                            Draw_UI();
+                        }
+                    }
+                    else if (keysym == XK_Return)
+                    {
+                        string tosend = T.line + "\n";
+                        if (T.fd_write >= 0)
+                            write(T.fd_write, tosend.c_str(), tosend.size());
+                        AddToBuffer(T, T.line + "\n");
+
+                        T.writing_index = 0;
+                        T.line.clear();
+                        Draw_UI();
+                    }
+                    else if (keysym == XK_BackSpace)
+                    {
+                        if (!T.line.empty() && T.writing_index > 0)
+                        {
+                            T.line.erase(T.writing_index - 1, 1);
+                            T.writing_index--;
+                        }
+                        Draw_UI();
+                    }
+                    else if (keysym == XK_Left)
+                    {
+                        if (--T.writing_index < 0)
+                            T.writing_index = 0;
+                        Draw_UI();
+                    }
+                    else if (keysym == XK_Right)
+                    {
+                        T.writing_index = min(T.writing_index + 1, (int)T.line.size());
+                        Draw_UI();
+                    }
+                    else if (len > 0)
+                    {
+                        T.line.insert(T.writing_index, Key_Buffer, len);
+                        T.writing_index += len;
+                        Draw_UI();
+                    }
+                }
                 else if (IS_CTRL && (keysym == XK_t || Key_Buffer[0] == 't'))
                 {
                     unique_ptr<Tab> New_Tab = Create_Tab();
@@ -316,14 +341,14 @@ void Process()
                     if (T.child_pid >= 0)
                         kill(T.child_pid, SIGINT);
 
-                    Add_To_Buffer(T, Get_Current_Path(T.child_pid) + T.line + "^C\n");
+                    AddToBuffer(T, Get_Current_Path(T.child_pid) + T.line + "^C\n");
                     T.line.clear();
                     Draw_UI();
                 }
                 else if (IS_CTRL && (keysym == XK_z || Key_Buffer[0] == 'z'))
                 {
                     Tab &T = *Tabs[Active_Tab];
-                    Add_To_Buffer(T, Get_Current_Path(T.child_pid) + T.line + "^Z\n");
+                    AddToBuffer(T, Get_Current_Path(T.child_pid) + T.line + "^Z\n");
                     if (T.child_pid > 0)
                     {
                         kill(T.child_pid, SIGTSTP);
@@ -335,7 +360,7 @@ void Process()
                 else if (IS_CTRL && (keysym == XK_d || Key_Buffer[0] == 'd'))
                 {
                     Tab &T = *Tabs[Active_Tab];
-                    if (T.fd_write >= 0)
+                    if (T.line.empty() && T.fd_write >= 0)
                     {
                         char EOF_Char = 4;
                         if (write(T.fd_write, &EOF_Char, 1) < 0)
@@ -399,10 +424,10 @@ void Process()
                     Tab &T = *Tabs[Active_Tab];
                     if (T.is_autocomplete)
                     {
-                        Add_To_Buffer(T, T.line);
+                        AddToBuffer(T, T.line);
 
                         int Options = keysym - XK_0;
-                        if (Options >= 0 && Options < T.suggestions.size())
+                        if (Options >= 0 && Options < (int)T.suggestions.size())
                             T.line = T.temp + T.suggestions[Options];
                         else
                             T.line = "";
@@ -423,7 +448,7 @@ void Process()
                 {
                     Tab &T = *Tabs[Active_Tab];
                     if (T.line.empty())
-                        return;
+                        break;
 
                     vector<string> args = Split_Text(T.line);
                     string Target = args[args.size() - 1], Suggestion;
@@ -432,7 +457,7 @@ void Process()
 
                     if (T.suggestions.size() == 1)
                     {
-                        for (int i = 0; i < args.size() - 1; i++)
+                        for (int i = 0; i < (int)args.size() - 1; i++)
                             Suggestion += args[i] + " ";
                         Suggestion += T.suggestions[0];
 
@@ -443,17 +468,17 @@ void Process()
                     }
                     else if (T.suggestions.size() > 1)
                     {
-                        Add_To_Buffer(T, Get_Current_Path(T.child_pid) + T.line + "\n");
-                        for (int i = 0; i < T.suggestions.size(); i++)
+                        AddToBuffer(T, Get_Current_Path(T.child_pid) + T.line + "\n");
+                        for (int i = 0; i < (int)T.suggestions.size(); i++)
                         {
                             Suggestion += to_string(i) + " - " + T.suggestions[i];
-                            if (i < T.suggestions.size() - 1)
+                            if (i < (int)T.suggestions.size() - 1)
                                 Suggestion += " ";
                         }
-                        for (int i = 0; i < args.size() - 1; i++)
+                        for (int i = 0; i < (int)args.size() - 1; i++)
                         {
                             T.temp += args[i];
-                            if (i < args.size() - 1)
+                            if (i < (int)args.size() - 1)
                                 T.temp += " ";
                         }
 
@@ -477,7 +502,7 @@ void Process()
                     {
                         vector<string> Match_Commands = Load_Search_From_File(T.line);
                         for (auto mc : Match_Commands)
-                            Add_To_Buffer(T, mc + "\n");
+                            AddToBuffer(T, mc + "\n");
 
                         T.line.clear();
                         T.writing_index = 0;
@@ -493,7 +518,15 @@ void Process()
                         }
                         else if (Trim(T.line) == "exit")
                         {
-                            running = false;
+                            if (Tabs.size() > 1)
+                            {
+                                Close_Tab(Active_Tab);
+                                Draw_UI();
+                            }
+                            else
+                            {
+                                running = false;
+                            }
                             break;
                         }
                         else
@@ -501,7 +534,7 @@ void Process()
                             string tosend = T.line + "\n";
                             if (T.fd_write >= 0)
                                 write(T.fd_write, tosend.c_str(), tosend.size());
-                            Add_To_Buffer(T, Get_Current_Path(T.child_pid) + T.line + "\n");
+                            AddToBuffer(T, Get_Current_Path(T.child_pid) + T.line + "\n");
                         }
                     }
 
@@ -555,7 +588,7 @@ void Process()
                 {
                     Tab &T = *Tabs[Active_Tab];
                     if (!T.is_autocomplete)
-                        T.writing_index = min(++T.writing_index, (int)T.line.size());
+                        T.writing_index = min(T.writing_index + 1, (int)T.line.size());
                     Draw_UI();
                 }
                 else if (keysym == XK_Up)
@@ -737,110 +770,6 @@ void Process()
     }
 }
 
-void Draw_UI()
-{
-    XClearWindow(display, window);
-    XSetForeground(display, gc, 0xFF2F2A29);
-    XFillRectangle(display, window, gc, 0, 0, Win_Width, Tab_Height);
-
-    int Tab_X = 0;
-    for (size_t i = 0; i < Tabs.size(); i++)
-    {
-        bool active = (int)i == Active_Tab;
-        int Tab_W = TAB_WIDTH;
-
-        string Tab_Title = Tabs[i]->title;
-        if (active)
-        {
-            XSetForeground(display, gc, BlackPixel(display, screen));
-            XFillRectangle(display, window, gc, Tab_X + 1, 1, Tab_W - 1, Tab_Height - 2);
-        }
-        else
-        {
-            XSetForeground(display, gc, 0xFF2F2A29);
-            XFillRectangle(display, window, gc, Tab_X + 1, 1, Tab_W - 1, Tab_Height - 2);
-        }
-
-        XSetForeground(display, gc, WhitePixel(display, screen));
-        int Close_X = Tab_X + Tab_W - CLOSE_BOX_W - 6;
-        int Close_Y = (Tab_Height - CLOSE_BOX_H) / 2;
-
-        DrawUtf8(Xft_Draw, Xft_Font, &Xft_Color, Close_X + 3, Close_Y + CLOSE_BOX_H - 3, "x");
-        DrawUtf8(Xft_Draw, Xft_Font, &Xft_Color, Tab_X + TAB_PADDING_L, Tab_Height - 8, Tab_Title);
-
-        Tab_X += Tab_W;
-    }
-
-    int Plus_X = Tab_X + 8;
-    int Plus_Y = (Tab_Height - PLUS_BOX_H) / 2;
-    XDrawRectangle(display, window, gc, Plus_X, Plus_Y, PLUS_BOX_W, PLUS_BOX_H);
-    DrawUtf8(Xft_Draw, Xft_Font, &Xft_Color, Plus_X + 5, Plus_Y + PLUS_BOX_H - 2, "+");
-
-    XDrawLine(display, window, gc, 0, Tab_Height, Win_Width, Tab_Height);
-
-    if (Tabs.empty())
-    {
-        DrawUtf8(Xft_Draw, Xft_Font, &Xft_Color, 8, Tab_Height + 20, "NO TABS");
-        XFlush(display);
-        return;
-    }
-
-    Tab &T = *Tabs[Active_Tab];
-    int font_ascent = Xft_Font ? Xft_Font->ascent : 12;
-    int font_descent = Xft_Font ? Xft_Font->descent : 6;
-    int line_height = font_ascent + font_descent;
-
-    int Y = Tab_Height + line_height;
-    int Total_Lines = T.buffer.size();
-    int Max_Lines_Visible = (Win_Height - Tab_Height - font_ascent - font_descent) / line_height;
-
-    if (T.scroll_index > Total_Lines - Max_Lines_Visible)
-        T.scroll_index = max(0, Total_Lines - Max_Lines_Visible);
-
-    for (int i = T.scroll_index; i < Total_Lines && Y < Win_Height; i++)
-    {
-        string Draw_Line = T.buffer[i];
-        if (Draw_Line.size() > 1000)
-            Draw_Line = Draw_Line.substr(0, 1000);
-        DrawUtf8(Xft_Draw, Xft_Font, &Xft_Color, 5, Y, Draw_Line);
-        Y += line_height;
-    }
-
-    string Prefix;
-    if (T.is_search)
-        Prefix = "एक दिन पहले मेरा दोसत अलासका गया था: ";
-    else if (T.is_autocomplete)
-        Prefix = "> ";
-    else
-        Prefix = Get_Current_Path(T.child_pid);
-
-    string in = Prefix + T.line;
-    DrawUtf8(Xft_Draw, Xft_Font, &Xft_Color, 5, Y, in);
-
-    string in_for_cursor = Prefix + T.line.substr(0, min((size_t)T.writing_index, T.line.size()));
-    int Cursor_X, Cursor_Y = Y - font_ascent + 2;
-    if (Xft_Font)
-    {
-        XGlyphInfo ext;
-        XftTextExtentsUtf8(display, Xft_Font, (FcChar8 *)in_for_cursor.c_str(), (int)in_for_cursor.size(), &ext);
-        Cursor_X = 5 + ext.xOff;
-    }
-    else
-    {
-        Cursor_X = 5 + (in_for_cursor.size() * 8);
-    }
-
-    if (Cursor_Visible && !T.is_autocomplete)
-    {
-        int cursor_h = line_height - 4;
-        if (cursor_h < 1)
-            cursor_h = line_height;
-        XFillRectangle(display, window, gc, Cursor_X, Cursor_Y, 2, cursor_h);
-    }
-
-    XFlush(display);
-}
-
 void Handle_Signal(int signal)
 {
     for (auto &T : Tabs)
@@ -860,80 +789,4 @@ void Handle_Signal(int signal)
         Cleanup_Shared_Memory();
         _exit(0);
     }
-}
-
-void ProcessPasteData(XSelectionEvent *event)
-{
-    if (event->property == None)
-    {
-        cout << "Error" << endl;
-        return;
-    }
-
-    Atom actualType;
-    int actualFormat;
-    unsigned char *data = nullptr;
-    unsigned long nItems, bytesAfter;
-
-    int readResult = XGetWindowProperty(
-        display,
-        window,
-        propertyAtom,
-        0,
-        LONG_MAX,
-        False,
-        AnyPropertyType,
-        &actualType,
-        &actualFormat,
-        &nItems,
-        &bytesAfter,
-        &data);
-
-    if (readResult == Success && data && nItems > 0)
-    {
-        if ((actualType == utf8StringAtom || actualType == XA_STRING) && actualFormat == 8)
-        {
-            Tab &T = *Tabs[Active_Tab];
-            string pasteData = string((char *)data, nItems);
-
-            T.line.insert(T.writing_index, pasteData);
-            T.writing_index += pasteData.size();
-
-            Draw_UI();
-        }
-    }
-
-    if (data)
-        XFree(data);
-
-    XDeleteProperty(display, window, propertyAtom);
-}
-
-void Add_To_Buffer(Tab &t, const string &data)
-{
-    istringstream iss(data);
-    string line;
-
-    while (getline(iss, line))
-    {
-        t.buffer.push_back(line);
-        if (t.buffer.size() > 4000)
-        {
-            t.buffer.erase(t.buffer.begin(), t.buffer.begin() + 1000);
-        }
-    }
-
-    int font_ascent = Xft_Font ? Xft_Font->ascent : 12;
-    int font_descent = Xft_Font ? Xft_Font->descent : 6;
-    int Max_Lines_Visible = (Win_Height - Tab_Height - font_ascent - font_descent) / (font_ascent + font_descent);
-    t.scroll_index = max(0, (int)t.buffer.size() - Max_Lines_Visible);
-
-    Draw_UI();
-}
-
-void DrawUtf8(XftDraw *draw, XftFont *font, XftColor *color, int x, int y, const string &s)
-{
-    if (!draw || !font)
-        return;
-    XftDrawStringUtf8(draw, color, font, x, y, (const FcChar8 *)s.c_str(), (int)s.size());
 }

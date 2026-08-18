@@ -1,0 +1,11 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Type=Application
+Name=XTerm
+Comment=Custom X11 terminal emulator built from scratch
+Exec=@PROJECT_DIR@/terminal
+Icon=@PROJECT_DIR@/assets/icon.png
+Path=@PROJECT_DIR@
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=XTerm

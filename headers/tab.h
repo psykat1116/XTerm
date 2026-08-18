@@ -12,6 +12,34 @@
 
 using namespace std;
 
+typedef enum
+{
+    Default = 0,
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+    Count
+} AnsiColor;
+
+typedef struct
+{
+    string text;
+    AnsiColor color = AnsiColor::Default;
+} Segment;
+
 struct Tab
 {
     pid_t child_pid;
@@ -19,6 +47,7 @@ struct Tab
     bool is_alive = false;
     bool is_search = false;
     bool is_autocomplete = false;
+    bool foreground_busy = false;
 
     int fd_read = -1;
     int fd_write = -1;
@@ -30,7 +59,12 @@ struct Tab
     string temp = "";
     string title = "";
 
-    vector<string> buffer;
+    string raw_pending = "";
+    bool current_bold = false;
+    vector<Segment> current_line;
+    AnsiColor current_color = AnsiColor::Default;
+
+    vector<vector<Segment>> buffer;
     vector<string> suggestions;
 };
 
@@ -42,7 +76,7 @@ unique_ptr<Tab> Create_Tab();
 
 void Close_Tab(int index)
 {
-    if (index < 0 || index >= Tabs.size() || Tabs.size() == 1)
+    if (index < 0 || index >= (int)Tabs.size() || Tabs.size() == 1)
         return;
 
     auto &T = Tabs[index];
