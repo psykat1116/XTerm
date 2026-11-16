@@ -46,6 +46,17 @@ SharedHistory *Shared_History_Data = nullptr;
 void Process();
 void Handle_Signal(int);
 
+/**
+ * @brief Entry point of the terminal front end.
+ *
+ * Installs signal handlers, sets up the shared history, opens the X display
+ * and main window, starts the first tab and runs the event loop. Shared
+ * memory, rendering and X resources are released on exit.
+ *
+ * @param argc Unused.
+ * @param argv Unused.
+ * @return 0 on normal exit, 1 if the display or renderer could not be initialized.
+ */
 int main(int argc, char *argv[])
 {
     signal(SIGINT, Handle_Signal);
@@ -83,7 +94,8 @@ int main(int argc, char *argv[])
         BlackPixel(display, screen));
 
     XMapWindow(display, window);
-    XSelectInput(display, window, ExposureMask | KeyPressMask | StructureNotifyMask | ButtonPressMask | SelectionNotify);
+    // SelectionNotify/SelectionRequest are always delivered, so they need no mask.
+    XSelectInput(display, window, ExposureMask | KeyPressMask | StructureNotifyMask | ButtonPressMask | ButtonReleaseMask | Button1MotionMask);
     XStoreName(display, window, "XTerm [Ctrl-T new tab, Ctrl-W close tab, Esc close]");
     Set_Window_Icon();
 
@@ -116,6 +128,15 @@ int main(int argc, char *argv[])
     return 0;
 }
 
+/**
+ * @brief Run the main event loop until the window is closed or Esc is pressed.
+ *
+ * Each iteration polls all live tab backends for output and feeds it to
+ * AddToBuffer(), then handles pending X events: keyboard input (editing,
+ * history, search, Tab completion, tab management and Ctrl-C / Z / D forwarding),
+ * mouse clicks and scrolling, clipboard paste and window resizes. It also
+ * blinks the cursor, keeping it solid for a while after user input.
+ */
 void Process()
 {
     static const int Blink_Interval = 500;
@@ -145,7 +166,8 @@ void Process()
             if (T->is_alive && T->fd_read >= 0)
                 File_Descriptors.push_back({T->fd_read, POLLIN, 0});
 
-        int Timeout_MS = 120, RC = 0;
+        // Tick faster while a drag selection is held, so auto-scroll feels smooth.
+        int Timeout_MS = Selection.dragging ? 20 : 120, RC = 0;
         if (!File_Descriptors.empty())
             RC = poll(File_Descriptors.data(), File_Descriptors.size(), Timeout_MS);
         else
@@ -208,7 +230,30 @@ void Process()
                 bool IS_CTRL = event.xkey.state & ControlMask;
                 int len = XLookupString(&event.xkey, Key_Buffer, sizeof(Key_Buffer), &keysym, nullptr);
 
-                if (keysym == XK_Escape)
+                bool IS_SHIFT = event.xkey.state & ShiftMask;
+                bool Is_Copy_Key = IS_CTRL && IS_SHIFT && (keysym == XK_C || keysym == XK_c);
+                bool Is_Paste_Key = IS_CTRL && IS_SHIFT && (keysym == XK_V || keysym == XK_v);
+
+                // Typing while scrolled up jumps back to the prompt (and drops the
+                // mouse selection), like other terminals.
+                bool Is_View_Key = IsModifierKey(keysym) || keysym == XK_Page_Up || keysym == XK_Page_Down ||
+                                   keysym == XK_Escape || Is_Copy_Key ||
+                                   (IS_CTRL && (keysym == XK_Left || keysym == XK_Right));
+                if (!Is_View_Key)
+                {
+                    Scroll_To_Bottom(*Tabs[Active_Tab]);
+                    Clear_Selection();
+                }
+
+                if (Is_Copy_Key)
+                {
+                    Copy_Selection_To_Clipboard();
+                }
+                else if (Is_Paste_Key)
+                {
+                    Request_Paste(clipboardAtom, event.xkey.time);
+                }
+                else if (keysym == XK_Escape)
                 {
                     running = false;
                 }
@@ -338,10 +383,17 @@ void Process()
                 else if (IS_CTRL && (keysym == XK_c || Key_Buffer[0] == 'c'))
                 {
                     Tab &T = *Tabs[Active_Tab];
+                    if (T.continuation && T.fd_write >= 0)
+                    {
+                        // Cancel the multi-line input the shell is waiting on.
+                        string cancel = string(CANCEL_LINE) + "\n";
+                        if (write(T.fd_write, cancel.c_str(), cancel.size()) < 0)
+                            perror("Error Writing Cancel Line");
+                    }
                     if (T.child_pid >= 0)
                         kill(T.child_pid, SIGINT);
 
-                    AddToBuffer(T, Get_Current_Path(T.child_pid) + T.line + "^C\n");
+                    AddToBuffer(T, Prompt_Prefix(T) + T.line + "^C\n");
                     T.line.clear();
                     Draw_UI();
                 }
@@ -529,12 +581,17 @@ void Process()
                             }
                             break;
                         }
+                        else if (Trim(T.line) == "/theme" || Trim(T.line).rfind("/theme ", 0) == 0)
+                        {
+                            AddToBuffer(T, Get_Current_Path(T.child_pid) + T.line + "\n");
+                            AddToBuffer(T, Theme_Command(Trim(Trim(T.line).substr(6))));
+                        }
                         else
                         {
                             string tosend = T.line + "\n";
                             if (T.fd_write >= 0)
                                 write(T.fd_write, tosend.c_str(), tosend.size());
-                            AddToBuffer(T, Get_Current_Path(T.child_pid) + T.line + "\n");
+                            AddToBuffer(T, Prompt_Prefix(T) + T.line + "\n");
                         }
                     }
 
@@ -568,9 +625,7 @@ void Process()
                 {
                     Tab &T = *Tabs[Active_Tab];
                     int Total_Lines = T.buffer.size();
-                    int font_ascent = Xft_Font ? Xft_Font->ascent : 12;
-                    int font_descent = Xft_Font ? Xft_Font->descent : 6;
-                    int Max_Lines_Visible = (Win_Height - Tab_Height - font_ascent - font_descent) / (font_ascent + font_descent);
+                    int Max_Lines_Visible = Visible_Line_Count();
                     T.scroll_index += 3;
                     if (T.scroll_index > Total_Lines - Max_Lines_Visible)
                         T.scroll_index = max(0, Total_Lines - Max_Lines_Visible);
@@ -647,10 +702,11 @@ void Process()
                     int Tab_W = TAB_WIDTH;
                     int Tab_Left = X;
                     int Tab_Right = X + Tab_W;
-                    int Close_X = Tab_Right - CLOSE_BOX_W - 6;
+                    int Close_X = Tab_Right - CLOSE_BOX_W - CLOSE_BOX_MARGIN;
                     int Close_Y = (Tab_Height - CLOSE_BOX_H) / 2;
 
-                    if (be->y >= Close_Y && be->y <= Close_Y + CLOSE_BOX_H && be->x >= Close_X && be->x <= Close_X + CLOSE_BOX_W)
+                    // Only the active tab shows a close button.
+                    if ((int)i == Active_Tab && be->y >= Close_Y && be->y <= Close_Y + CLOSE_BOX_H && be->x >= Close_X && be->x <= Close_X + CLOSE_BOX_W)
                     {
                         Close_Tab(i);
                         Draw_UI();
@@ -683,7 +739,19 @@ void Process()
                     }
                     continue;
                 }
-                if (be->button == Button4)
+                if (be->button == Button1 && be->y > Tab_Height)
+                {
+                    // Click: start a drag selection (a plain click clears the old one);
+                    // double click selects a word, triple click the whole line.
+                    Selection_Click(*Tabs[Active_Tab], be->x, be->y, be->time);
+                    Draw_UI();
+                }
+                else if (be->button == Button2)
+                {
+                    // Middle click pastes the PRIMARY selection, as on other X11 apps.
+                    Request_Paste(primaryAtom, be->time);
+                }
+                else if (be->button == Button4)
                 {
                     Tab &T = *Tabs[Active_Tab];
                     T.scroll_index -= 3;
@@ -694,9 +762,7 @@ void Process()
                 else if (be->button == Button5)
                 {
                     Tab &T = *Tabs[Active_Tab];
-                    int font_ascent = Xft_Font ? Xft_Font->ascent : 12;
-                    int font_descent = Xft_Font ? Xft_Font->descent : 6;
-                    int Max_Lines_Visible = (Win_Height - Tab_Height - font_ascent - font_descent) / (font_ascent + font_descent);
+                    int Max_Lines_Visible = Visible_Line_Count();
                     int Total_Lines = T.buffer.size();
                     T.scroll_index += 3;
                     if (T.scroll_index > Total_Lines - Max_Lines_Visible)
@@ -704,6 +770,30 @@ void Process()
                     Draw_UI();
                 }
 
+                break;
+            }
+            case MotionNotify:
+            {
+                // Only the newest pointer position matters; skip queued ones.
+                while (XCheckTypedWindowEvent(display, window, MotionNotify, &event))
+                {
+                }
+                if (Selection_Extend(*Tabs[Active_Tab], event.xmotion.x, event.xmotion.y))
+                    Draw_UI();
+                break;
+            }
+            case ButtonRelease:
+            {
+                if (event.xbutton.button == Button1)
+                {
+                    Selection_End();
+                    Draw_UI();
+                }
+                break;
+            }
+            case SelectionRequest:
+            {
+                Handle_Selection_Request(&event.xselectionrequest);
                 break;
             }
             case SelectionNotify:
@@ -749,6 +839,9 @@ void Process()
             }
         }
 
+        if (!Tabs.empty() && Selection_Autoscroll(*Tabs[Active_Tab]))
+            Draw_UI();
+
         auto Current_Time = chrono::steady_clock::now();
         auto Elapsed_Blink_Time = chrono::duration_cast<chrono::milliseconds>(Current_Time - Last_Blink).count();
         auto Elapsed_Edit_Time = chrono::duration_cast<chrono::milliseconds>(Current_Time - Edit_Blink).count();
@@ -770,6 +863,14 @@ void Process()
     }
 }
 
+/**
+ * @brief Terminate all tab backends and, for a real signal, clean up and exit.
+ *
+ * Sends SIGTERM to every live backend and closes its pipes. If @p signal is
+ * nonzero, the shared history is removed and the process exits.
+ *
+ * @param signal Signal number received (SIGINT, SIGQUIT or SIGTSTP), or 0.
+ */
 void Handle_Signal(int signal)
 {
     for (auto &T : Tabs)

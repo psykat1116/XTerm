@@ -12,6 +12,12 @@
 
 using namespace std;
 
+/**
+ * @brief Foreground colors supported by the ANSI/SGR renderer.
+ *
+ * Values 1-8 are the standard colors (SGR 30-37), 9-16 the bright colors
+ * (SGR 90-97). @c Count is the number of entries and sizes the palette.
+ */
 typedef enum
 {
     Default = 0,
@@ -31,41 +37,52 @@ typedef enum
     BrightMagenta,
     BrightCyan,
     BrightWhite,
+    PromptHost,   ///< Theme prompt color for "user@host" (private SGR 200).
+    PromptParent, ///< Theme prompt color for the parent part of the path (private SGR 201).
+    PromptDir,    ///< Theme prompt color for the current folder (private SGR 202).
+    PromptArrow,  ///< Theme prompt color for the "❯" (private SGR 203).
     Count
 } AnsiColor;
 
+/**
+ * @brief A run of text drawn in a single color.
+ */
 typedef struct
 {
-    string text;
-    AnsiColor color = AnsiColor::Default;
+    string text;                          ///< UTF-8 text without escape sequences.
+    AnsiColor color = AnsiColor::Default; ///< Effective color to draw the text with.
 } Segment;
 
+/**
+ * @brief State of one terminal tab and its shell backend process.
+ */
 struct Tab
 {
-    pid_t child_pid;
+    pid_t child_pid; ///< PID of the forked ./function shell backend.
 
-    bool is_alive = false;
-    bool is_search = false;
-    bool is_autocomplete = false;
-    bool foreground_busy = false;
+    bool is_alive = false;        ///< True while the backend is running and its pipes are open.
+    bool is_search = false;       ///< True while in reverse history search mode (Ctrl-R).
+    bool is_autocomplete = false; ///< True while a numbered Tab-completion menu is shown.
+    bool foreground_busy = false; ///< True while the backend runs an interactive foreground command.
+    bool continuation = false;    ///< True while the backend waits for more lines (e.g. an unclosed quote).
 
-    int fd_read = -1;
-    int fd_write = -1;
-    int scroll_index = 0;
-    int writing_index = 0;
-    int history_index = -1;
+    int fd_read = -1;       ///< Non-blocking read end of the backend's stdout/stderr pipe.
+    int fd_write = -1;      ///< Write end of the backend's stdin pipe.
+    int scroll_index = 0;   ///< Index of the first scrollback line shown.
+    int writing_index = 0;  ///< Cursor position (byte offset) within #line.
+    int history_index = -1; ///< Position while browsing history; -1 when not browsing.
 
-    string line = "";
-    string temp = "";
-    string title = "";
+    string line = "";  ///< Current contents of the input line.
+    string temp = "";  ///< Command text before the completed word, saved during autocomplete.
+    string title = ""; ///< Label shown in the tab bar.
 
-    string raw_pending = "";
-    bool current_bold = false;
-    vector<Segment> current_line;
-    AnsiColor current_color = AnsiColor::Default;
+    string raw_pending = "";                      ///< Incomplete escape or UTF-8 bytes carried over to the next read.
+    bool current_bold = false;                    ///< Bold state from the last SGR sequence.
+    vector<Segment> current_line;                 ///< Output line being built, not yet ended by a newline.
+    AnsiColor current_color = AnsiColor::Default; ///< Foreground color from the last SGR sequence.
 
-    vector<vector<Segment>> buffer;
-    vector<string> suggestions;
+    vector<vector<Segment>> buffer; ///< Scrollback of completed output lines.
+    vector<string> suggestions;     ///< Candidates offered by the latest Tab completion.
 };
 
 int Active_Tab;
@@ -74,6 +91,15 @@ vector<unique_ptr<Tab>> Tabs;
 void Close_Tab(int);
 unique_ptr<Tab> Create_Tab();
 
+/**
+ * @brief Close a tab, terminating its backend and releasing its pipes.
+ *
+ * Sends SIGHUP to the backend, closes both pipe ends and removes the tab from
+ * #Tabs, clamping #Active_Tab to a valid index. Does nothing if @p index is
+ * out of range or only one tab is open.
+ *
+ * @param index Index of the tab in #Tabs.
+ */
 void Close_Tab(int index)
 {
     if (index < 0 || index >= (int)Tabs.size() || Tabs.size() == 1)
@@ -103,6 +129,15 @@ void Close_Tab(int index)
         Active_Tab = min(Active_Tab, (int)Tabs.size() - 1);
 }
 
+/**
+ * @brief Create a new tab backed by a fresh ./function shell process.
+ *
+ * Creates two pipes, forks, and execs ./function in a new session with its
+ * stdin, stdout and stderr connected to the pipes. The parent's read end is
+ * made non-blocking.
+ *
+ * @return The new tab, or nullptr if pipe() or fork() failed.
+ */
 unique_ptr<Tab> Create_Tab()
 {
     int Parent_To_Child[2];

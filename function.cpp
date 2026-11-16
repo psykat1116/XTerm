@@ -30,12 +30,15 @@
 
 using namespace std;
 
+/**
+ * @brief One command started by the multiWatch built-in.
+ */
 typedef struct
 {
-    int fd;
-    pid_t pid;
-    string cmd;
-    string tempfile;
+    int fd;          ///< Non-blocking read descriptor on the command's output file.
+    pid_t pid;       ///< PID of the command (also its process group ID).
+    string cmd;      ///< Command text, shown in the output header.
+    string tempfile; ///< Temporary file receiving the command's stdout and stderr.
 } Watchprocess;
 
 pid_t shell_pgid;
@@ -53,6 +56,11 @@ SharedHistory *Shared_History_Data = nullptr;
 void Handle_Signal(int);
 void Run_Command(string &);
 
+/**
+ * @brief Block SIGINT and SIGTSTP so the signal handler cannot run while shared lists are changed.
+ *
+ * @param[out] old_mask Receives the previous signal mask, for Restore_Watch_Signals().
+ */
 static void Block_Watch_Signals(sigset_t &old_mask)
 {
     sigset_t block_mask;
@@ -62,11 +70,19 @@ static void Block_Watch_Signals(sigset_t &old_mask)
     sigprocmask(SIG_BLOCK, &block_mask, &old_mask);
 }
 
+/**
+ * @brief Restore the signal mask saved by Block_Watch_Signals().
+ *
+ * @param old_mask Signal mask to restore.
+ */
 static void Restore_Watch_Signals(const sigset_t &old_mask)
 {
     sigprocmask(SIG_SETMASK, &old_mask, nullptr);
 }
 
+/**
+ * @brief Point stdin at /dev/null so a child process does not read the front end's input.
+ */
 static void Redirect_Stdin_To_DevNull()
 {
     int DevNull_FD = open("/dev/null", O_RDONLY);
@@ -77,6 +93,14 @@ static void Redirect_Stdin_To_DevNull()
     }
 }
 
+/**
+ * @brief Read the next newline-terminated line from stdin.
+ *
+ * Bytes read past the newline are kept in #g_pending_input for later calls.
+ *
+ * @param[out] line Receives the line without the trailing newline.
+ * @return false on EOF or read error.
+ */
 static bool Read_Next_Line(string &line)
 {
     while (true)
@@ -97,6 +121,16 @@ static bool Read_Next_Line(string &line)
     }
 }
 
+/**
+ * @brief Entry point of the shell backend that runs inside each tab.
+ *
+ * Reads command lines from stdin and runs them with Run_Command(). While an
+ * interactive foreground command runs, input from the front end is forwarded
+ * to it (0x04 closes its stdin), and the byte 0x02 is written to stdout when
+ * it exits or stops.
+ *
+ * @return 0 when stdin reaches EOF.
+ */
 int main()
 {
     setlocale(LC_ALL, "");
@@ -187,6 +221,16 @@ int main()
     return 0;
 }
 
+/**
+ * @brief Handle SIGINT and SIGTSTP received by the shell backend.
+ *
+ * SIGTSTP is forwarded to the process groups of all running children, and the
+ * terminal is returned to the shell. For any other signal, the children are
+ * sent SIGTERM, and all multiWatch processes are terminated and their
+ * temporary files removed.
+ *
+ * @param sig Signal number received.
+ */
 void Handle_Signal(int sig)
 {
     if (sig == SIGTSTP)
@@ -221,9 +265,25 @@ void Handle_Signal(int sig)
     WProcess.clear();
 }
 
+/**
+ * @brief Parse and run one command line.
+ *
+ * Supports the built-ins cd, echo (with quotes, escapes, multi-line quoted
+ * strings and $VAR expansion), history and multiWatch "cmd1" "cmd2" ...,
+ * as well as pipelines (a | b | c) and single external commands with <, >
+ * and >> redirection. A command without input redirection runs in the
+ * foreground with an interactive stdin pipe and returns immediately; main()
+ * then forwards input and waits for it.
+ *
+ * @param cmd Command line; trimmed in place and may be modified during parsing.
+ */
 void Run_Command(string &cmd)
 {
     if (cmd.empty())
+        return;
+
+    // A late Ctrl+C cancel that arrived after multi-line input already ended.
+    if (cmd == CANCEL_LINE)
         return;
 
     cmd = Trim(cmd);
@@ -284,10 +344,9 @@ void Run_Command(string &cmd)
                 }
             }
 
-            string expanded_string = Expand_Environmental_Variables(unescaped_content);
-
-            wstring w = UTF8_To_Wstring(expanded_string);
-            wcout << w << "\n";
+            // Print the UTF-8 bytes with cout. wcout would switch stdout to wide
+            // mode, which fails once cout has written to it (and vice versa).
+            cout << Expand_Environmental_Variables(unescaped_content) << '\n' << flush;
         }
         else
         {
@@ -303,9 +362,7 @@ void Run_Command(string &cmd)
             }
             if (quote_char == 0)
             {
-                string expanded_string = Expand_Environmental_Variables(rest);
-                wstring w = UTF8_To_Wstring(expanded_string);
-                wcout << w << "\n";
+                cout << Expand_Environmental_Variables(rest) << '\n' << flush;
             }
             else
             {
@@ -313,6 +370,8 @@ void Run_Command(string &cmd)
                 string next_line;
                 bool found_end = false;
                 bool eof = false;
+                bool cancelled = false;
+                bool continuation_shown = false;
 
                 while (!found_end)
                 {
@@ -331,17 +390,33 @@ void Run_Command(string &cmd)
                     if (found_end)
                         break;
 
-                    fflush(stdout);
-                    if (Read_Next_Line(next_line))
+                    // Tell the front end we are waiting for the closing quote,
+                    // so it shows a "> " continuation prompt like bash.
+                    if (!continuation_shown)
                     {
-                        content_buffer += "\n" + next_line;
+                        cout << CONTINUATION_START << flush;
+                        continuation_shown = true;
                     }
-                    else
+
+                    fflush(stdout);
+                    if (!Read_Next_Line(next_line))
                     {
                         eof = true;
                         break;
                     }
+                    if (next_line == CANCEL_LINE)
+                    {
+                        cancelled = true;
+                        break;
+                    }
+                    content_buffer += "\n" + next_line;
                 }
+
+                if (continuation_shown)
+                    cout << CONTINUATION_END << flush;
+
+                if (cancelled)
+                    return;
 
                 if (eof && !found_end)
                 {
@@ -370,10 +445,7 @@ void Run_Command(string &cmd)
                     }
                 }
 
-                string expanded_string = Expand_Environmental_Variables(unescaped_content);
-
-                wstring w = UTF8_To_Wstring(expanded_string);
-                wcout << w << '\n';
+                cout << Expand_Environmental_Variables(unescaped_content) << '\n' << flush;
             }
         }
     }

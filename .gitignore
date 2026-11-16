@@ -1,6 +1,9 @@
 # Build binaries
 /function
 /terminal
+/bench/ansi_bench
+/bench/shell_bench
+/bench/xkeys
 
 # Object files
 *.o

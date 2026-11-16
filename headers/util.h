@@ -14,6 +14,12 @@
 
 #define HISTORY_FILE_NAME ".terminal.history.txt"
 
+// Bytes the shell backend (function.cpp) and the front end use to talk
+// about multi-line input. 0x01/0x02 (foreground busy) are handled in ansi.h.
+const char CONTINUATION_START = '\x0e'; ///< Shell -> front end: waiting for more lines (show "> ").
+const char CONTINUATION_END = '\x0f';   ///< Shell -> front end: multi-line input finished.
+const char *const CANCEL_LINE = "\x03"; ///< Front end -> shell: a line holding just this cancels multi-line input (Ctrl+C).
+
 using namespace std;
 namespace fs = std::filesystem;
 
@@ -31,6 +37,11 @@ static bool Find_LCS_String(const string &, const string &);
 vector<string> Get_Suggestion_From_Directory(pid_t, string &);
 bool Extract_First_Last_Unescaped_Quotes(const string &, string &);
 
+/**
+ * @brief Get the current local time as a string.
+ *
+ * @return Time formatted as "YYYY-MM-DD HH:MM:SS".
+ */
 string Current_Time()
 {
     time_t now = time(nullptr);
@@ -39,6 +50,12 @@ string Current_Time()
     return string(buf);
 }
 
+/**
+ * @brief Remove leading and trailing whitespace.
+ *
+ * @param str Input string.
+ * @return A copy of @p str without surrounding whitespace.
+ */
 string Trim(const string &str)
 {
     size_t a = 0;
@@ -52,6 +69,15 @@ string Trim(const string &str)
     return str.substr(a, b - a + 1);
 }
 
+/**
+ * @brief Build a colored shell prompt showing a process's working directory.
+ *
+ * The directory is read from /proc/<pid>/cwd. If it cannot be read, the
+ * directory part is left out.
+ *
+ * @param pid Process whose working directory is shown.
+ * @return A prompt of the form "user@host ~/cwd ❯ " with ANSI color codes.
+ */
 string Get_Current_Path(pid_t pid)
 {
     const char *user = getenv("USER");
@@ -68,19 +94,57 @@ string Get_Current_Path(pid_t pid)
     string Proc_Path = "/proc/" + to_string(pid) + "/cwd";
     ssize_t len = readlink(Proc_Path.c_str(), buffer, sizeof(buffer) - 1);
 
-    string prompt = "\x1b[1;32m" + string(user) + "@" + hostname + "\x1b[0m";
-
+    // Starship-style prompt: "user@host ~/parent/dir ❯ ".
+    string prompt = "\x1b[200m" + string(user) + "@" + hostname + ":" + "\x1b[0m";
     if (len != -1)
     {
         buffer[len] = '\0';
-        prompt = prompt + ":\x1b[1;34m" + buffer + "\x1b[0m$ ";
-    }
-    else
-        prompt += "$ ";
+        string cwd = buffer;
 
+        // Show the home directory as "~", like bash does.
+        const char *home = getenv("HOME");
+        if (!home || !*home)
+        {
+            struct passwd *pw = getpwuid(getuid());
+            home = pw ? pw->pw_dir : nullptr;
+        }
+        if (home)
+        {
+            string home_dir = home;
+            if (home_dir.size() > 1 && home_dir.back() == '/')
+                home_dir.pop_back();
+
+            if (home_dir.size() > 1 && cwd.compare(0, home_dir.size(), home_dir) == 0 &&
+                (cwd.size() == home_dir.size() || cwd[home_dir.size()] == '/'))
+                cwd.replace(0, home_dir.size(), "~");
+        }
+
+        size_t last_slash = cwd.find_last_of('/');
+        string parent, current = cwd;
+        if (cwd != "/" && last_slash != string::npos)
+        {
+            parent = cwd.substr(0, last_slash + 1);
+            current = cwd.substr(last_slash + 1);
+        }
+
+        // prompt += " ";
+        if (!parent.empty())
+            prompt += "\x1b[201m" + parent + "\x1b[0m";
+        prompt += "\x1b[202m" + current + "\x1b[0m";
+    }
+
+    prompt += " \x1b[203m❯\x1b[0m ";
     return prompt;
 }
 
+/**
+ * @brief Split a string into whitespace-separated words.
+ *
+ * Quotes are not interpreted; see Command_Parser() for that.
+ *
+ * @param cmd Input string.
+ * @return The non-empty words in order.
+ */
 vector<string> Split_Text(string &cmd)
 {
     vector<string> args;
@@ -97,6 +161,14 @@ vector<string> Split_Text(string &cmd)
     return args;
 }
 
+/**
+ * @brief Convert a multi-byte string in the current locale (normally UTF-8) to a wide string.
+ *
+ * Invalid or incomplete byte sequences are skipped.
+ *
+ * @param str Multi-byte input string.
+ * @return The converted wide string.
+ */
 wstring UTF8_To_Wstring(const string &str)
 {
     wstring out;
@@ -131,6 +203,14 @@ wstring UTF8_To_Wstring(const string &str)
     return out;
 }
 
+/**
+ * @brief Convert a wide string to a multi-byte string in the current locale (normally UTF-8).
+ *
+ * Characters that cannot be represented are skipped.
+ *
+ * @param wstr Wide input string.
+ * @return The converted multi-byte string.
+ */
 string Wstring_To_UTF8(const wstring &wstr)
 {
     string out;
@@ -149,6 +229,16 @@ string Wstring_To_UTF8(const wstring &wstr)
     return out;
 }
 
+/**
+ * @brief Split a command line into arguments, handling quotes and glob patterns.
+ *
+ * Text in single or double quotes stays in one argument and the quote
+ * characters are removed. Arguments containing '*', '?' or '[' are expanded
+ * with glob(); if nothing matches, the pattern is kept as is.
+ *
+ * @param cmd Command line to parse.
+ * @return Argument list suitable for building an execvp() argv.
+ */
 vector<string> Command_Parser(const string &cmd)
 {
     vector<string> tokens;
@@ -217,6 +307,17 @@ vector<string> Command_Parser(const string &cmd)
     return expanded;
 }
 
+/**
+ * @brief Search the history file for commands matching a query.
+ *
+ * Exact matches are returned if there are any. Otherwise, commands sharing a
+ * common substring of more than 2 characters with the query are returned
+ * (see Find_LCS_String()).
+ *
+ * @param search Search query.
+ * @return A header line followed by the matching commands, or a single
+ *         "No history matches" line. Empty if @p search is empty.
+ */
 vector<string> Load_Search_From_File(string &search)
 {
     if (search.empty())
@@ -254,6 +355,12 @@ vector<string> Load_Search_From_File(string &search)
     return Match_Commands;
 }
 
+/**
+ * @brief Count double quotes that are not escaped by an odd number of backslashes.
+ *
+ * @param str Input string.
+ * @return Number of unescaped '"' characters.
+ */
 int Count_Unescaped_Double_Quotes(const string &str)
 {
     int count = 0;
@@ -277,6 +384,15 @@ int Count_Unescaped_Double_Quotes(const string &str)
     return count;
 }
 
+/**
+ * @brief Replace $NAME references with the values of environment variables.
+ *
+ * A variable name runs from after '$' to the next space. Undefined variables
+ * are left as "$NAME".
+ *
+ * @param input Text that may contain $NAME references.
+ * @return The text with defined variables substituted.
+ */
 string Expand_Environmental_Variables(const string &input)
 {
     string result;
@@ -315,6 +431,16 @@ string Expand_Environmental_Variables(const string &input)
     return result;
 }
 
+/**
+ * @brief Check whether two strings share a common substring longer than 2 characters.
+ *
+ * Uses longest-common-substring dynamic programming and stops early once a
+ * match of length 3 is found.
+ *
+ * @param s1 First string.
+ * @param s2 Second string.
+ * @return true if the longest common substring is longer than 2 characters.
+ */
 static bool Find_LCS_String(const string &s1, const string &s2)
 {
     int m = s1.length();
@@ -347,6 +473,16 @@ static bool Find_LCS_String(const string &s1, const string &s2)
     return max_len > 2;
 }
 
+/**
+ * @brief List files and directories in a process's working directory that start with a prefix.
+ *
+ * Used for Tab completion. The directory is read via /proc/<pid>/cwd, and
+ * directory names get a trailing '/'.
+ *
+ * @param pid    Process whose working directory is searched.
+ * @param Prefix Prefix the entry names must start with.
+ * @return Matching entry names, in directory order.
+ */
 vector<string> Get_Suggestion_From_Directory(pid_t pid, string &Prefix)
 {
     vector<string> Files_In_Directory;
@@ -382,6 +518,16 @@ vector<string> Get_Suggestion_From_Directory(pid_t pid, string &Prefix)
     return Files_In_Directory;
 }
 
+/**
+ * @brief Extract the text between the first and last unescaped double quotes.
+ *
+ * In the extracted text, \\" becomes " and \\\\ becomes \\. Other escape
+ * sequences are left as they are.
+ *
+ * @param s Input string.
+ * @param[out] out_content Receives the extracted text on success.
+ * @return true if two unescaped double quotes were found.
+ */
 bool Extract_First_Last_Unescaped_Quotes(const string &s, string &out_content)
 {
     ssize_t first = -1, last = -1;

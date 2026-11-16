@@ -4,11 +4,25 @@
 #include <cstdio>
 using namespace std;
 
+/**
+ * @brief A line segment of the icon glyph, in pixel coordinates.
+ */
 typedef struct {
-    double x1, y1;
-    double x2, y2;
+    double x1, y1; ///< Start point.
+    double x2, y2; ///< End point.
 } Stroke;
 
+/**
+ * @brief Compute the shortest distance from a point to a line segment.
+ *
+ * @param px X coordinate of the point.
+ * @param py Y coordinate of the point.
+ * @param x1 X coordinate of the segment start.
+ * @param y1 Y coordinate of the segment start.
+ * @param x2 X coordinate of the segment end.
+ * @param y2 Y coordinate of the segment end.
+ * @return Euclidean distance from (px, py) to the nearest point on the segment.
+ */
 static double PointSegmentDistance(double px, double py, double x1, double y1, double x2, double y2)
 {
     double dx = x2 - x1, dy = y2 - y1;
@@ -21,6 +35,11 @@ static double PointSegmentDistance(double px, double py, double x1, double y1, d
     return sqrt(ex * ex + ey * ey);
 }
 
+/**
+ * @brief Draw the 64x64 ">_" application icon and print it to stdout as XPM.
+ *
+ * @return 0.
+ */
 int main()
 {
     // larger than the 32x32 runtime window icon: file

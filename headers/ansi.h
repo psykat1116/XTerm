@@ -10,7 +10,15 @@
 
 using namespace std;
 
-// Append text to the tab
+/**
+ * @brief Append plain text to the tab's in-progress line using the tab's current style.
+ *
+ * The text is merged into the last segment when the effective color matches,
+ * otherwise a new segment is started.
+ *
+ * @param t    Tab whose current line receives the text.
+ * @param text Plain text without escape sequences or newlines.
+ */
 static void AppendText(Tab &t, const string &text)
 {
     if (text.empty())
@@ -23,17 +31,41 @@ static void AppendText(Tab &t, const string &text)
         t.current_line.push_back({text, col});
 }
 
-// If text buffer overflow then trim old text
+/**
+ * @brief Commit the tab's in-progress line to its scrollback buffer.
+ *
+ * When the buffer grows past 4000 lines, the oldest 1000 lines are discarded.
+ *
+ * @param t Tab whose current line is committed.
+ */
 static void FlushLine(Tab &t)
 {
     t.buffer.push_back(t.current_line);
     t.current_line.clear();
     if (t.buffer.size() > 4000)
+    {
         t.buffer.erase(t.buffer.begin(), t.buffer.begin() + 1000);
+
+        // Keep a selection in this tab pointing at the same text.
+        if (Selection.tab == &t)
+        {
+            Selection.anchor_row -= 1000;
+            Selection.head_row -= 1000;
+            if (Selection.anchor_row < 0 || Selection.head_row < 0)
+                Clear_Selection();
+        }
+    }
 }
 
-// If UTF-8 is incompleted then trim the incompleted part.
-// Incompleted part will be conve in this next part.
+/**
+ * @brief Move a trailing, incomplete UTF-8 sequence from @p text into @p pending.
+ *
+ * Output from the child can be split in the middle of a multi-byte character.
+ * The incomplete tail is held back so it can be prepended to the next read.
+ *
+ * @param[in,out] text    Text to check; truncated if it ends mid-character.
+ * @param[out]    pending Receives the incomplete trailing bytes, if any.
+ */
 static void SplitIncompleteUtf8(string &text, string &pending)
 {
     if (text.empty())
@@ -68,7 +100,20 @@ static void SplitIncompleteUtf8(string &text, string &pending)
     }
 }
 
-// Add input to tab buffer for printing out data
+/**
+ * @brief Feed raw output from the shell backend into a tab's display buffer.
+ *
+ * Parses the stream incrementally: SGR sequences update the tab's style, other
+ * CSI and OSC sequences are dropped, '\\n' commits a line and '\\r' is ignored.
+ * The control bytes 0x01 and 0x02 mark the start and end of a foreground
+ * process and set Tab::foreground_busy; #CONTINUATION_START / #CONTINUATION_END
+ * set Tab::continuation. Incomplete escape sequences and UTF-8
+ * characters are kept in Tab::raw_pending for the next call. Afterwards the tab
+ * is scrolled to the bottom and the UI is redrawn.
+ *
+ * @param t    Tab receiving the output.
+ * @param data Raw bytes read from the backend.
+ */
 void AddToBuffer(Tab &t, const string &data)
 {
     string input = t.raw_pending + data;
@@ -157,6 +202,12 @@ void AddToBuffer(Tab &t, const string &data)
             t.foreground_busy = (c == '\x01');
             i++;
         }
+        else if (c == CONTINUATION_START || c == CONTINUATION_END)
+        {
+            flush_text_run();
+            t.continuation = (c == CONTINUATION_START);
+            i++;
+        }
         else
         {
             text_run += (char)c;
@@ -167,10 +218,7 @@ void AddToBuffer(Tab &t, const string &data)
     SplitIncompleteUtf8(text_run, t.raw_pending);
     flush_text_run();
 
-    int font_ascent = Xft_Font ? Xft_Font->ascent : 12;
-    int font_descent = Xft_Font ? Xft_Font->descent : 6;
-    int Max_Lines_Visible = (Win_Height - Tab_Height - font_ascent - font_descent) / (font_ascent + font_descent);
-    t.scroll_index = max(0, (int)t.buffer.size() - Max_Lines_Visible);
+    t.scroll_index = max(0, (int)t.buffer.size() - Visible_Line_Count());
 
     Draw_UI();
 }

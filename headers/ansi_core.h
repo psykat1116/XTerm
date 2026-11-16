@@ -10,7 +10,14 @@ vector<Segment> AnsiToSegments(const string &s);
 AnsiColor EffectiveColor(AnsiColor color, bool bold);
 void ApplySGR(AnsiColor &color, bool &bold, const string &params);
 
-// Convert string number to integer number
+/**
+ * @brief Parse a decimal integer from a string, ignoring non-digit characters.
+ *
+ * Used for SGR parameter tokens. An empty or digit-free string yields 0.
+ *
+ * @param s String containing the decimal digits.
+ * @return The parsed non-negative integer value.
+ */
 int ParseInt(const string &s) {
     int val = 0;
     for (char c : s)
@@ -20,7 +27,18 @@ int ParseInt(const string &s) {
     return val;
 }
 
-// Applying Color to the text segmant
+/**
+ * @brief Apply an SGR (Select Graphic Rendition) parameter list to the current text style.
+ *
+ * Handles reset (0), bold on/off (1/22), default foreground (39), the
+ * standard foreground colors (30-37), the bright foreground colors (90-97) and
+ * the private codes 200-203, which this terminal's own prompt uses to pick the
+ * theme's prompt colors. Other codes are ignored. An empty parameter list is treated as a reset.
+ *
+ * @param[in,out] color  Current foreground color, updated in place.
+ * @param[in,out] bold   Current bold flag, updated in place.
+ * @param[in]     params Semicolon-separated SGR parameters (the text between "ESC[" and "m").
+ */
 void ApplySGR(AnsiColor &color, bool &bold, const string &params)
 {
     if (params.empty())
@@ -51,6 +69,8 @@ void ApplySGR(AnsiColor &color, bool &bold, const string &params)
             color = (AnsiColor)(1 + (code - 30));
         else if (code >= 90 && code <= 97)
             color = (AnsiColor)(9 + (code - 90));
+        else if (code >= 200 && code <= 203)
+            color = (AnsiColor)((int)AnsiColor::PromptHost + (code - 200));
 
         if (sep == string::npos)
             break;
@@ -58,7 +78,16 @@ void ApplySGR(AnsiColor &color, bool &bold, const string &params)
     }
 }
 
-// Converting normal color to deeper shades
+/**
+ * @brief Resolve the color actually drawn for a given color and bold state.
+ *
+ * Bold text is rendered with the bright variant of the eight standard colors,
+ * and bold default text is rendered as bright white.
+ *
+ * @param color Base foreground color.
+ * @param bold  Whether bold is active.
+ * @return The color to draw with.
+ */
 AnsiColor EffectiveColor(AnsiColor color, bool bold)
 {
     if (!bold)
@@ -73,7 +102,16 @@ AnsiColor EffectiveColor(AnsiColor color, bool bold)
     return color;
 }
 
-// Converting string to proper segment format for proper color rendering
+/**
+ * @brief Split a string containing ANSI escape sequences into colored segments.
+ *
+ * CSI sequences ("ESC[ ... final-byte") are stripped; those ending in 'm' are
+ * applied as SGR styling. Adjacent runs with the same effective color are
+ * merged into one segment. An unterminated CSI sequence is kept as literal text.
+ *
+ * @param s Input text that may contain ANSI escape sequences.
+ * @return Ordered list of segments, each holding plain text and its color.
+ */
 vector<Segment> AnsiToSegments(const string &s)
 {
     vector<Segment> segments;
